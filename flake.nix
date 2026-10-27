@@ -4,11 +4,11 @@
   inputs = {
     # nixpkgs-unstable: fastmcp is not yet in 26.05.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    flake-lib.url = "github:jgus-org/flake-lib/v1";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs = { self, nixpkgs, flake-lib }:
+    flake-lib.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
         inherit (pkgs) lib;
