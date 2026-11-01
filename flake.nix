@@ -2,8 +2,8 @@
   description = "MCP server exposing ComfyUI image generation as tools.";
 
   inputs = {
-    # nixpkgs-unstable: fastmcp is not yet in 26.05.
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Release 26.05: fastmcp is not yet on nixpkgs-unstable, where fastmcp-slim is marked broken.
+    nixpkgs.url = "github:NixOS/nixpkgs/release-26.05";
     flake-lib.url = "github:jgus-org/flake-lib/v1";
   };
 
