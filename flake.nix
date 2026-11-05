@@ -2,8 +2,7 @@
   description = "MCP server exposing ComfyUI image generation as tools.";
 
   inputs = {
-    # Release 26.05: fastmcp is not yet on nixpkgs-unstable, where fastmcp-slim is marked broken.
-    nixpkgs.url = "github:NixOS/nixpkgs/release-26.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-lib.url = "github:jgus-org/flake-lib/v1";
   };
 
@@ -14,7 +13,7 @@
         inherit (pkgs) lib;
 
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
-          fastmcp
+          mcp
           httpx
           websockets
           pillow

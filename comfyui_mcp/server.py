@@ -9,19 +9,22 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import io
 import random
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
-from fastmcp import FastMCP
-from fastmcp.utilities.types import Image
+from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from PIL import Image as PILImage
 
 from . import models, workflows
-from .comfyui_client import ComfyUIClient, OutputImage
+from .comfyui_client import ComfyUIClient, ComfyUIError, OutputImage
 from .config import Config
 
 # Ceiling on the longest edge of an image handed to the model — only to bound the base64 payload under
@@ -45,7 +48,7 @@ _EXT_FROM_MIME = {
 # file in ComfyUI's /output or /input forever. ComfyUI has no delete API, so real cleanup needs filesystem
 # access to /s/comfyui (a separate decision); until then it grows unbounded and is pruned manually.
 config = Config.from_env()
-mcp = FastMCP("comfyui")
+mcp = MCPServer("comfyui")
 
 MODELS_DIR = Path(config.models_dir)
 
@@ -122,7 +125,7 @@ VISION_RETRY_DELAYS = (10.0, 10.0, 10.0)
 def _resolve_profile[T](profiles: dict[str, T], name: str, default: str) -> T:
     key = name or default
     if key not in profiles:
-        raise ValueError(f"Unknown profile {name!r}. Available: {', '.join(profiles)}.")
+        raise ToolError(f"Unknown profile {name!r}. Available: {', '.join(profiles)}.")
     return profiles[key]
 
 
@@ -137,7 +140,7 @@ def _decode_id(image_id: str) -> OutputImage:
     code, sep, rest = image_id.partition(":")
     image_type = _TYPE_FROM_CODE.get(code)
     if not sep or not image_type or not rest:
-        raise ValueError(f"Invalid image id {image_id!r} (expected e.g. 'o:comfyui-mcp_00042_.png').")
+        raise ToolError(f"Invalid image id {image_id!r} (expected e.g. 'o:comfyui-mcp_00042_.png').")
     subfolder, slash, filename = rest.rpartition("/")
     return OutputImage(filename=filename, subfolder=subfolder if slash else "", type=image_type)
 
@@ -165,8 +168,19 @@ async def _stage_as_input(client: ComfyUIClient, image_id: str) -> str:
     return await client.upload_image(data, f"mcp-in-{uuid.uuid4().hex[:12]}.png")
 
 
-# output_schema=None on every tool: they return content/text, not a structured object. Without it FastMCP infers an output schema from the return annotation and the client rejects the unstructured result.
-@mcp.tool(output_schema=None)
+def _client_errors[T](fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> T:
+        try:
+            return await fn(*args, **kwargs)
+        except (ComfyUIError, httpx.HTTPError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    return wrapper
+
+
+@mcp.tool(structured_output=False)
+@_client_errors
 async def generate_image(
     prompt: str,
     width: int = 1024,
@@ -196,12 +210,13 @@ async def generate_image(
     async with ComfyUIClient(config.comfyui_url) as client:
         rendered = await client.run(workflow)
     if not rendered:
-        raise RuntimeError("ComfyUI produced no image")
+        raise ToolError("ComfyUI produced no image")
     image_id = _encode_id(rendered[0].output)
     return f"Generated image {image_id} ({width}x{height}, profile '{profile or GENERATE_DEFAULT}', seed {seed}). Call view_image('{image_id}') to see it."
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(structured_output=False)
+@_client_errors
 async def download_image(url: str) -> str:
     """Fetch an external image by URL into the ComfyUI store. Returns an image id, NOT the image itself.
 
@@ -212,9 +227,9 @@ async def download_image(url: str) -> str:
         resp.raise_for_status()
     content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
     if not content_type.startswith("image/"):
-        raise ValueError(f"URL did not return an image (content-type: {content_type or 'unknown'}).")
+        raise ToolError(f"URL did not return an image (content-type: {content_type or 'unknown'}).")
     if len(resp.content) > MAX_DOWNLOAD_BYTES:
-        raise ValueError(f"Image too large ({len(resp.content)} bytes; max {MAX_DOWNLOAD_BYTES}).")
+        raise ToolError(f"Image too large ({len(resp.content)} bytes; max {MAX_DOWNLOAD_BYTES}).")
     ext = _EXT_FROM_MIME.get(content_type, ".png")
     async with ComfyUIClient(config.comfyui_url) as client:
         ref = await client.upload_image(resp.content, f"mcp-dl-{uuid.uuid4().hex[:12]}{ext}")
@@ -223,7 +238,8 @@ async def download_image(url: str) -> str:
     return f"Downloaded image {image_id} from {url}. Call view_image('{image_id}') to see it."
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(structured_output=False)
+@_client_errors
 async def edit_image(image_id: str, instruction: str, seed: int | None = None, profile: str = "") -> str:
     """Edit an image with an instruction. Returns a new image id (call view_image to see it).
 
@@ -254,12 +270,13 @@ async def edit_image(image_id: str, instruction: str, seed: int | None = None, p
             )
         rendered = await client.run(workflow)
     if not rendered:
-        raise RuntimeError("ComfyUI produced no image")
+        raise ToolError("ComfyUI produced no image")
     new_id = _encode_id(rendered[0].output)
     return f"Edited {image_id} into {new_id} (profile '{profile or EDIT_DEFAULT}', seed {seed}). Call view_image('{new_id}') to see it."
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(structured_output=False)
+@_client_errors
 async def compose_images(
     image_ids: list[str], instruction: str, seed: int | None = None, profile: str = ""
 ) -> str:
@@ -274,7 +291,7 @@ async def compose_images(
     seed: omit for a random seed.
     """
     if not 1 <= len(image_ids) <= 3:
-        raise ValueError("compose_images takes 1 to 3 image ids.")
+        raise ToolError("compose_images takes 1 to 3 image ids.")
     chosen = _resolve_profile(COMPOSE_PROFILES, profile, COMPOSE_DEFAULT)
     if seed is None:
         seed = random.randint(0, 2**31 - 1)
@@ -288,13 +305,14 @@ async def compose_images(
         )
         rendered = await client.run(workflow)
     if not rendered:
-        raise RuntimeError("ComfyUI produced no image")
+        raise ToolError("ComfyUI produced no image")
     new_id = _encode_id(rendered[0].output)
     joined = ", ".join(image_ids)
     return f"Composed [{joined}] into {new_id} (profile '{profile or COMPOSE_DEFAULT}', seed {seed}). Call view_image('{new_id}') to see it."
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(structured_output=False)
+@_client_errors
 async def pose_transfer(
     character_id: str, pose_ref_id: str, extra: str = "", seed: int | None = None, profile: str = ""
 ) -> str:
@@ -328,12 +346,13 @@ async def pose_transfer(
         )
         rendered = await client.run(workflow)
     if not rendered:
-        raise RuntimeError("ComfyUI produced no image")
+        raise ToolError("ComfyUI produced no image")
     new_id = _encode_id(rendered[0].output)
     return f"Reposed {character_id} to match {pose_ref_id} → {new_id} (profile '{profile or POSE_DEFAULT}', seed {seed}). Call view_image('{new_id}') to see it."
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(structured_output=False)
+@_client_errors
 async def view_image(image_id: str) -> list:
     """Return an image by id so you can see it.
 
@@ -344,7 +363,8 @@ async def view_image(image_id: str) -> list:
     return [f"Image {image_id}:", Image(data=_thumbnail_png(data), format="png")]
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(structured_output=False)
+@_client_errors
 async def ask_image(image_id: str, question: str, profile: str = "") -> str:
     """Ask a vision model a question about an image and get a text answer.
 
@@ -384,11 +404,12 @@ async def ask_image(image_id: str, question: str, profile: str = "") -> str:
             if resp.status_code != 429 and resp.status_code < 500:
                 break
     if resp.is_error:
-        raise RuntimeError(f"Vision API {resp.status_code} for model {chosen.model!r}: {resp.text}")
+        raise ToolError(f"Vision API {resp.status_code} for model {chosen.model!r}: {resp.text}")
     return resp.json()["choices"][0]["message"]["content"]
 
 
-@mcp.tool(output_schema=None)
+@mcp.tool(structured_output=False)
+@_client_errors
 async def list_images(limit: int = 20) -> str:
     """List recent images known to ComfyUI, newest first, with their ids and prompts.
 
@@ -430,7 +451,7 @@ def _extract_prompt_text(prompt: object) -> str:
 
 
 def main() -> None:
-    mcp.run(transport="http", host=config.host, port=config.port)
+    mcp.run(transport="streamable-http", host=config.host, port=config.port)
 
 
 if __name__ == "__main__":
