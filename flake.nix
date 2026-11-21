@@ -2,7 +2,7 @@
   description = "MCP server exposing ComfyUI image generation as tools.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-lib.url = "github:jgus-org/flake-lib/v1";
   };
 
